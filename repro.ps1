@@ -24,6 +24,20 @@
               bin\server\classes.jsa with a symlink and run plain `java -version`
               (exactly the field condition: default archive, default/auto mode)
 
+  If the minimal Test B does not crash on its own, Tests C/D/E add the two ways
+  Bazel's runfiles tree differs from a plain copy, one variable at a time, to
+  pin down the root cause:
+
+    Test C -- DEPTH: the same real-file copy but launched from a deep (~200
+              char) path, like Bazel's runfiles location near MAX_PATH.
+    Test D -- TREE: a full per-file symlink mirror of the JDK at a short path,
+              so java.exe/jvm.dll/classes.jsa are ALL symlinks (Bazel's shape).
+    Test E -- DEPTH + TREE: the full symlink mirror at a deep path -- the
+              faithful standalone reproduction of Bazel's runfiles JDK.
+
+  The Attribution block then reports which ingredient (depth, the symlink tree,
+  or only their combination) flips a working JDK into a crashing one.
+
   A run is classified CRASH only when an hs_err_pid*.log (a real access
   violation) is written -- NOT merely on a nonzero exit. A clean
   "-Xshare:on cannot map archive" abort is reported as ABORT and never mistaken
@@ -80,6 +94,57 @@ function New-FileSymlink($linkPath, $targetPath) {
     throw "Expected a SymbolicLink at $linkPath but got '$($item.LinkType)'. " +
           "Enable Windows Developer Mode or run elevated so real symlinks can be created."
   }
+}
+
+# Create a directory whose full path is at least $TargetLen characters by
+# nesting short segments under $Base. Used to launch java from a deep path like
+# Bazel's runfiles tree (~200 chars), to test the path-depth hypothesis.
+function New-DeepDir($Base, $TargetLen) {
+  $p = $Base
+  $guard = 0
+  while ($p.Length -lt $TargetLen -and $guard -lt 400) {
+    $p = Join-Path $p 'd'
+    $guard++
+  }
+  $null = New-Item -ItemType Directory -Force -Path $p -ErrorAction Stop
+  return $p
+}
+
+# Mirror an entire JDK as Bazel's runfiles tree does: recreate the directory
+# structure with real directories, but make every *file* a symbolic link back to
+# the corresponding real file under $Src (absolute target, like Bazel's links
+# into the external cache). So java.exe, jvm.dll AND classes.jsa all become
+# symlinks. Files whose mirrored path would exceed Windows' 260-char limit are
+# skipped (deep legal/doc files the JVM never reads at startup).
+function New-SymlinkTree($Src, $Dst) {
+  $created = 0; $skipped = 0
+  $null = New-Item -ItemType Directory -Force -Path $Dst -ErrorAction Stop
+  Get-ChildItem -LiteralPath $Src -Recurse -Force | ForEach-Object {
+    $rel      = $_.FullName.Substring($Src.Length).TrimStart('\')
+    $linkPath = Join-Path $Dst $rel
+    try {
+      if ($_.PSIsContainer) {
+        $null = New-Item -ItemType Directory -Force -Path $linkPath -ErrorAction Stop
+      } else {
+        $parent = Split-Path $linkPath -Parent
+        if (-not (Test-Path -LiteralPath $parent)) {
+          $null = New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop
+        }
+        $null = New-Item -ItemType SymbolicLink -Path $linkPath -Target $_.FullName -ErrorAction Stop
+        $created++
+      }
+    } catch { $skipped++ }
+  }
+  [pscustomobject]@{ Created = $created; Skipped = $skipped }
+}
+
+# robocopy is long-path aware, so it can copy a JDK into a deep (>260 internal)
+# destination that Copy-Item would choke on. Exit codes 0-7 mean success.
+function Copy-JdkDeep($Src, $Dst) {
+  $p = Start-Process robocopy `
+    -ArgumentList @("`"$Src`"", "`"$Dst`"", '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:1', '/W:1') `
+    -NoNewWindow -PassThru -Wait
+  if ($p.ExitCode -ge 8) { throw "robocopy failed copying $Src -> $Dst (exit $($p.ExitCode))" }
 }
 
 # Run `java <args> -version`, classify the outcome, collect crash artifacts.
@@ -220,6 +285,53 @@ $results += Invoke-JavaProbe -Tag 'B3-symlink-on'      -JavaExe $copyJava -Expec
 $results += Invoke-JavaProbe -Tag 'B4-symlink-off'     -JavaExe $copyJava -Expect 'OK'          -ExtraArgs @('-Xshare:off')
 
 # ---------------------------------------------------------------------------
+# Tests C/D/E -- root-cause attribution: which Bazel-only ingredient flips it?
+#
+# Test B is the minimal symlink condition at a SHORT path with a REAL-file JDK
+# copy (only classes.jsa is a link). Bazel's runfiles tree differs two ways:
+#   * the JDK is launched from a DEEP path (~200 chars, near MAX_PATH)
+#   * the launcher itself is a symlink -- java.exe, jvm.dll AND classes.jsa are
+#     all per-file links into the external cache (a full SYMLINK TREE)
+# These three tests toggle those two variables one at a time around B:
+#   C  deep path,  real-file copy (only classes.jsa linked)  -> isolates DEPTH
+#   D  short path, full symlink tree                         -> isolates the TREE
+#   E  deep path,  full symlink tree                         -> faithful Bazel mirror
+# They are exploratory (Expect = OK-or-CRASH); the Attribution block below reads
+# which crashed to conclude the trigger. Aim ~200 chars so <deep>\bin\java.exe
+# matches the field/Bazel depth while essential JDK files stay under MAX_PATH.
+# ---------------------------------------------------------------------------
+$deepTarget = 200 - ('\bin\java.exe'.Length)   # so <deep>\bin\java.exe ~= 200
+
+# Test C -- deep path, real-file copy, only classes.jsa is a symlink.
+Write-Section "Test C -- DEPTH: real-file JDK copy at a deep path, classes.jsa symlinked"
+$deepReal = New-DeepDir (Join-Path $OutDir 'C-deep-real') $deepTarget
+Write-Host "Deep copy root ($($deepReal.Length) chars): $deepReal"
+Copy-JdkDeep $Jdk $deepReal
+$deepRealJava = Join-Path $deepReal 'bin\java.exe'
+$deepRealJsa  = Join-Path $deepReal $relJsa
+New-FileSymlink $deepRealJsa $realJsa
+Write-Host "java.exe path is $($deepRealJava.Length) chars; classes.jsa is now: $((Get-FileFacts $deepRealJsa).Kind)"
+$results += Invoke-JavaProbe -Tag 'C-deep-real-symlink' -JavaExe $deepRealJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+
+# Test D -- short path, full per-file symlink tree (Bazel runfiles shape).
+Write-Section "Test D -- TREE: full per-file symlink mirror of the JDK at a short path"
+$treeShort = Join-Path $OutDir 'D-tree-short'
+$dStats = New-SymlinkTree $Jdk $treeShort
+$treeShortJava = Join-Path $treeShort 'bin\java.exe'
+Write-Host "Symlinked $($dStats.Created) files ($($dStats.Skipped) skipped over MAX_PATH)."
+Write-Host "java.exe is now: $((Get-FileFacts $treeShortJava).Kind); classes.jsa is now: $((Get-FileFacts (Join-Path $treeShort $relJsa)).Kind)"
+$results += Invoke-JavaProbe -Tag 'D-tree-short' -JavaExe $treeShortJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+
+# Test E -- deep path AND full symlink tree: the faithful standalone Bazel mirror.
+Write-Section "Test E -- DEPTH + TREE: full symlink mirror at a deep path (Bazel mirror)"
+$treeDeep = New-DeepDir (Join-Path $OutDir 'E-deep-tree') $deepTarget
+$eStats = New-SymlinkTree $Jdk $treeDeep
+$treeDeepJava = Join-Path $treeDeep 'bin\java.exe'
+Write-Host "Deep tree root ($($treeDeep.Length) chars): $treeDeep"
+Write-Host "Symlinked $($eStats.Created) files ($($eStats.Skipped) skipped over MAX_PATH); java.exe path is $($treeDeepJava.Length) chars."
+$results += Invoke-JavaProbe -Tag 'E-deep-tree' -JavaExe $treeDeepJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 Write-Section "Results"
@@ -231,24 +343,57 @@ $results |
                          @{L='Frame';E={$_.Frame}} |
   Out-String | Write-Host
 
-# Reproduced == the symlink crashed with a real access violation while the
-# byte-identical real file and the -Xshare:off workaround both ran cleanly.
-$aCrash = ($results | Where-Object Tag -eq 'A2-symlink-auto').Result -eq 'CRASH'
-$aReal  = ($results | Where-Object Tag -eq 'A1-real-on').Result      -eq 'OK'
-$bCrash = ($results | Where-Object Tag -eq 'B2-symlink-default').Result -eq 'CRASH'
-$bReal  = ($results | Where-Object Tag -eq 'B1-copy-real').Result       -eq 'OK'
-$bOff   = ($results | Where-Object Tag -eq 'B4-symlink-off').Result     -eq 'OK'
+# Per-test crash flags (CRASH == a real access-violation hs_err was written).
+function Crashed($tag) { (($results | Where-Object Tag -eq $tag).Result) -eq 'CRASH' }
+$aCrash = Crashed 'A2-symlink-auto'
+$aReal  = ($results | Where-Object Tag -eq 'A1-real-on').Result    -eq 'OK'
+$bCrash = Crashed 'B2-symlink-default'  # short, real copy, classes.jsa symlink
+$bReal  = ($results | Where-Object Tag -eq 'B1-copy-real').Result  -eq 'OK'
+$bOff   = ($results | Where-Object Tag -eq 'B4-symlink-off').Result -eq 'OK'
+$bBase  = $bCrash
+$cDeep  = Crashed 'C-deep-real-symlink' # + depth
+$dTree  = Crashed 'D-tree-short'        # + symlink tree
+$eBoth  = Crashed 'E-deep-tree'         # + depth + tree
 
-$reproduced = ($aReal -and $aCrash) -or ($bReal -and $bCrash -and $bOff)
-$verdict = if ($reproduced) {
-  "REPRODUCED -- symlinked classes.jsa crashes the JVM (access violation); byte-identical real file and -Xshare:off both run cleanly."
+# Minimal repro: a single symlinked classes.jsa crashes (clean single-variable
+# shape) with the real file and -Xshare:off both clean. Variant repro: the bug
+# only shows once the Bazel-shape ingredients (depth and/or the symlink tree)
+# are added -- still a genuine access-violation reproduction, just not minimal.
+$reproducedMinimal = ($aReal -and $aCrash) -or ($bReal -and $bCrash -and $bOff)
+$reproducedVariant = $cDeep -or $dTree -or $eBoth
+$reproduced = $reproducedMinimal -or $reproducedVariant
+$verdict = if ($reproducedMinimal) {
+  "REPRODUCED (minimal) -- a single symlinked classes.jsa crashes the JVM (access violation); byte-identical real file and -Xshare:off both run cleanly."
+} elseif ($reproducedVariant) {
+  "REPRODUCED (Bazel-shape) -- the minimal single-symlink case did not crash, but a Bazel-shape variant did; see ROOT CAUSE below."
 } elseif (($results | Where-Object Result -eq 'CRASH')) {
-  "PARTIAL -- a crash was observed but not in the clean single-variable shape; inspect the table and hs_err logs."
+  "PARTIAL -- a crash was observed but not in a clean shape; inspect the table and hs_err logs."
 } else {
-  "NOT reproduced on this JDK/OS -- no access violation observed."
+  "NOT reproduced on this JDK/OS -- no access violation observed, even by the faithful Bazel mirror (E)."
 }
 
 Write-Host "VERDICT: $verdict"
+
+# ---------------------------------------------------------------------------
+# Attribution -- compare B/C/D/E to name which Bazel-only ingredient is the
+# trigger. The differences from baseline B tell us whether depth, the symlink
+# tree, or only their combination flips a working JDK into a crashing one.
+# ---------------------------------------------------------------------------
+$attribution = `
+  if     ($bBase) { "Baseline already crashes -- a single symlinked classes.jsa at a short path is sufficient; depth and the symlink tree are not required." }
+  elseif ($cDeep -and $dTree) { "Either ingredient alone reproduces -- both DEPTH (C) and the SYMLINK TREE (D) independently flip the JDK into a crash." }
+  elseif ($cDeep) { "DEPTH is the trigger -- a deep launch path (C) crashes where the identical short-path copy (B) does not; the symlink tree is not required." }
+  elseif ($dTree) { "The SYMLINK TREE is the trigger -- symlinking the launcher/runtime (D), not just classes.jsa, crashes where B does not; depth is not required." }
+  elseif ($eBoth) { "Only DEPTH + TREE together reproduce (E) -- neither ingredient alone (C, D) is enough; the combination is required." }
+  else            { "Not reproduced even by the faithful Bazel mirror (E) -- the trigger involves a factor these tests do not capture." }
+
+Write-Section "Attribution (B baseline vs C depth vs D tree vs E both)"
+$results |
+  Where-Object Tag -in 'B2-symlink-default','C-deep-real-symlink','D-tree-short','E-deep-tree' |
+  Format-Table -AutoSize @{L='Tag';E={$_.Tag}}, @{L='Result';E={$_.Result}}, @{L='Frame';E={$_.Frame}} |
+  Out-String | Write-Host
+Write-Host "ROOT CAUSE: $attribution"
+
 Write-Host ""
 Write-Host "JDK     : $($realFacts.Path)"
 Write-Host "Artifacts (hs_err logs + minidumps + console output): $OutDir"
@@ -264,13 +409,14 @@ $report = [pscustomobject]@{
   symlink    = $linkFacts
   reproduced = $reproduced
   verdict    = $verdict
+  attribution = $attribution
   runs       = $results
 }
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'results.json')
 
 # Step summary when running under GitHub Actions.
 if ($env:GITHUB_STEP_SUMMARY) {
-  $lines = @("### $verdict", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
+  $lines = @("### $verdict", "", "**Root cause:** $attribution", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
   foreach ($r in $results) { $lines += "| $($r.Tag) | ``$($r.Command)`` | $($r.Exit) | **$($r.Result)** | $($r.Frame) |" }
   $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 }

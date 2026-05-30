@@ -17,10 +17,18 @@ from the picture and reproduces it with a plain JDK + one symlink.
   affected configs, what the field minidump showed, exact repro steps, expected
   vs actual, workaround, and which artifacts to attach.
 - **[`repro.ps1`](repro.ps1)** — a self-contained Windows repro (no Bazel). It
-  isolates the single variable (regular file vs symlink) two ways and only
-  reports `CRASH` when a real access violation (`hs_err`) is written — a clean
-  `-Xshare:on` "cannot map archive" abort is reported separately and never
-  mistaken for the bug.
+  isolates the single variable (regular file vs symlink) two ways (Tests A/B)
+  and only reports `CRASH` when a real access violation (`hs_err`) is written —
+  a clean `-Xshare:on` "cannot map archive" abort is reported separately and
+  never mistaken for the bug. If the minimal single-symlink case does not crash,
+  Tests C/D/E add the two ways Bazel's runfiles tree differs from a plain copy —
+  **path depth** (~200-char launch path) and a **full per-file symlink tree**
+  (java.exe/jvm.dll/classes.jsa all symlinked) — one variable at a time, and the
+  Attribution block names which one is the trigger.
+- **[`bazel-repro/`](bazel-repro/)** — a ~5-file Bazel project that reproduces
+  the crash through Bazel's real runfiles machinery (CI confirmed: a subprocess
+  JVM from the runfiles symlink tree dies with `EXCEPTION_ACCESS_VIOLATION`,
+  while a plain `java_test` does not).
 
 ## What the repro proves
 
