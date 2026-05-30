@@ -20,11 +20,6 @@ name: JDK classes.jsa symlink crash repro
 
 on:
   workflow_dispatch:
-    inputs:
-      distribution:
-        description: setup-java distribution (temurin, zulu, microsoft, ...)
-        default: "temurin"
-        required: false
 
 jobs:
   repro:
@@ -32,13 +27,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: ["11", "17", "21", "25"]
-    name: "JDK ${{ matrix.java }}"
+        java: ["17", "21", "25"]
+        distribution: ["temurin", "zulu", "microsoft"]
+        exclude:
+          # Microsoft Build of OpenJDK doesn't publish a 25 build in setup-java.
+          - java: "25"
+            distribution: "microsoft"
+    name: "${{ matrix.distribution }} JDK ${{ matrix.java }}"
     steps:
-      - name: Set up JDK ${{ matrix.java }}
+      - name: Set up ${{ matrix.distribution }} JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
-          distribution: ${{ inputs.distribution || 'temurin' }}
+          distribution: ${{ matrix.distribution }}
           java-version: ${{ matrix.java }}
 
       - name: Show JDK info
@@ -58,20 +58,26 @@ jobs:
           Write-Host "Copying real JDK ($real) -> $link"
           Copy-Item -Recurse -Force $real $link
 
-          # The server-VM CDS archive normally lives at lib/server/classes.jsa.
-          # Fall back to a recursive search in case the layout differs.
-          $linkJsa = Join-Path $link "lib\server\classes.jsa"
-          if (-not (Test-Path $linkJsa)) {
+          # On Windows the server-VM CDS archive lives at bin\server\classes.jsa
+          # (on Linux/macOS it's lib/server/classes.jsa). Try both, then fall
+          # back to a recursive search so we never silently skip.
+          $candidates = @(
+            (Join-Path $link "bin\server\classes.jsa"),
+            (Join-Path $link "lib\server\classes.jsa")
+          )
+          $linkJsa = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $linkJsa) {
             $found = Get-ChildItem -Path $link -Recurse -Filter classes.jsa -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($found) { $linkJsa = $found.FullName }
           }
 
-          if (-not (Test-Path $linkJsa)) {
+          if (-not $linkJsa) {
             Write-Host "::warning::No default CDS archive (classes.jsa) ships with this JDK — nothing to symlink."
             "has-cds=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
+          Write-Host "Found CDS archive to replace: $linkJsa"
 
           $realJsa = $linkJsa.Replace($link, $real)
           Write-Host "Replacing copy's CDS archive with a symlink:"
@@ -87,6 +93,9 @@ jobs:
           Write-Host "LinkType  : $($item.LinkType)"
           Write-Host "Target    : $($item.Target)"
           if ($item.LinkType -ne "SymbolicLink") { throw "classes.jsa is not a symlink!" }
+          if (-not ($linkJsa.ToLower().EndsWith("server\classes.jsa"))) {
+            throw "Symlinked archive is not at <vm>\server\classes.jsa: $linkJsa"
+          }
 
           New-Item -ItemType Directory -Force -Path "C:\crash" | Out-Null
           "has-cds=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -140,7 +149,7 @@ jobs:
         if: always() && steps.build.outputs.has-cds == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: jdk-crash-artifacts-${{ matrix.java }}
+          name: jdk-crash-${{ matrix.distribution }}-${{ matrix.java }}
           path: |
             C:\crash\hs_err_pid*.log
             C:\crash\*.mdmp
@@ -164,6 +173,6 @@ jobs:
             $verdict = "❓ Inconclusive — crash exit=$crash, workaround exit=$work"
           }
 
-          $row = "| ${{ matrix.java }} | $verdict |"
-          Write-Host $row
-          "## JDK ${{ matrix.java }}: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $label = "${{ matrix.distribution }} JDK ${{ matrix.java }}"
+          Write-Host "| $label | $verdict |"
+          "## $label: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
