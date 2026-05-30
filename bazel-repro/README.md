@@ -29,6 +29,23 @@ pins down the *minimal* trigger.
   all on (set in `.bazelrc`). Drop any and Bazel stops producing the symlinked
   `classes.jsa`.
 
+## Result (confirmed on `windows-latest`, 2026-05-30)
+
+**Reproduced.** With Developer Mode on (real symlinks), `remotejdk_25` (Zulu
+25.0.2+10-LTS):
+
+| experiment | result |
+|---|---|
+| 1. `java_test //:empty_test` | **passed** — no crash |
+| 2. `sh_test` `java -version` from runfiles | **crashed** — `EXCEPTION_ACCESS_VIOLATION (0xc0000005)` in `jvm.dll` |
+| 3. `sh_test` `java -jar tiny_deploy.jar` | **crashed** — same signature |
+
+So the **minimal trigger is a subprocess JVM launched out of the runfiles
+symlink tree** — `java -version` is enough. No deploy jar, no deep path, and not
+`java_test` (Bazel's test wrapper launches java in a way that avoids the
+symlinked archive). The CI verdict is green when the crash reproduces (that is
+this repo's purpose) and red if it does not.
+
 ## Experiment order
 
 Each target isolates one hypothesis. Whichever crashes **first** is the minimal

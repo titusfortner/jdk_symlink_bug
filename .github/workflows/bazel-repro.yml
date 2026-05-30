@@ -73,14 +73,49 @@ jobs:
             --cache_test_results=no `
             "--test_env=JDK_JAVA_OPTIONS=-XX:ErrorFile=D:/hs_err_pid%p.log"
 
-      - name: Summary
+      # Source of truth. NOT continue-on-error: this step's pass/fail is the
+      # job's verdict, so a crash is never swallowed by the green badges the
+      # continue-on-error experiments leave behind. A run is only "REPRODUCED"
+      # when a real EXCEPTION_ACCESS_VIOLATION hs_err was written — a benign
+      # "cannot map archive" abort never counts as the bug.
+      - name: Verdict
         if: always()
         shell: pwsh
         run: |
-          Write-Host "empty_test        : ${{ steps.exp1.outcome }}"
-          Write-Host "subprocess_version: ${{ steps.exp2.outcome }}"
-          Write-Host "subprocess_deploy : ${{ steps.exp3.outcome }}"
-          Write-Host "(an 'failure' outcome is the crash signal; check uploaded hs_err logs)"
+          $hs = @(Get-ChildItem D:\hs_err_pid*.log -ErrorAction SilentlyContinue)
+          $av = @($hs | Where-Object {
+            Select-String -Path $_.FullName -Pattern 'EXCEPTION_ACCESS_VIOLATION' -Quiet
+          })
+          $reproduced = $av.Count -gt 0
+
+          function Row($name, $outcome) {
+            $r = if ($outcome -eq 'failure') { 'CRASHED' } else { 'ok (no crash)' }
+            "| $name | $r |"
+          }
+
+          $md = @(
+            "## Bazel JDK ``classes.jsa`` symlink repro"
+            ""
+            "| experiment | result |"
+            "|---|---|"
+            (Row "1. java_test //:empty_test (control)" "${{ steps.exp1.outcome }}")
+            (Row "2. sh_test: java -version (subprocess)" "${{ steps.exp2.outcome }}")
+            (Row "3. sh_test: java -jar deploy.jar (subprocess)" "${{ steps.exp3.outcome }}")
+            ""
+          )
+          if ($reproduced) {
+            $md += "**REPRODUCED** — $($av.Count) JVM(s) died with ``EXCEPTION_ACCESS_VIOLATION`` mapping the symlinked ``classes.jsa``. hs_err logs are in the ``bazel-jdk-symlink-repro`` artifact."
+          } else {
+            $md += "**NOT reproduced** — no ``EXCEPTION_ACCESS_VIOLATION`` hs_err was written."
+          }
+          $md | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append | Out-Host
+
+          # Green = the bug reproduced (this repo's purpose). Red = it did not.
+          if (-not $reproduced) {
+            Write-Error "Did not reproduce the crash (no EXCEPTION_ACCESS_VIOLATION hs_err)."
+            exit 1
+          }
+          Write-Host "REPRODUCED: $($av.Count) access-violation crash(es)."
 
       - name: Collect Bazel test logs
         if: always()
