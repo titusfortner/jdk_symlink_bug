@@ -1,0 +1,50 @@
+load("@rules_java//java:defs.bzl", "java_binary", "java_test")
+
+# ---------------------------------------------------------------------------
+# Experiment 1: pure Java, no subprocess of our own.
+#
+# Bazel's test wrapper execs the remotejdk_25 `java` from the runfiles tree to
+# run this "test" (use_testrunner = False -> it's just a main()). If JVM init
+# crashes mapping the symlinked classes.jsa, java_test alone reproduces the bug
+# and the minimal repro is pure Java.
+# ---------------------------------------------------------------------------
+java_test(
+    name = "empty_test",
+    srcs = ["Main.java"],
+    main_class = "Main",
+    use_testrunner = False,
+)
+
+# A plain binary. Its implicit `:tiny_deploy.jar` (a fat jar) is launched as a
+# subprocess in Experiment 3.
+java_binary(
+    name = "tiny",
+    srcs = ["Main.java"],
+    main_class = "Main",
+)
+
+# ---------------------------------------------------------------------------
+# Experiment 2: the explicit "Ruby pattern" — a non-Java test that locates the
+# runfiles JDK and spawns `java -version` as a subprocess. If this crashes but
+# Experiment 1 does not, the trigger is "subprocess JVM out of runfiles", not
+# java_test specifically.
+# ---------------------------------------------------------------------------
+sh_test(
+    name = "subprocess_version",
+    srcs = ["run_java_version.sh"],
+    data = ["@rules_java//toolchains:current_java_runtime"],
+)
+
+# ---------------------------------------------------------------------------
+# Experiment 3: subprocess launches a fat deploy jar from the runfiles tree
+# (`java -jar tiny_deploy.jar`). If only this crashes, the deploy-jar launch is
+# part of the trigger.
+# ---------------------------------------------------------------------------
+sh_test(
+    name = "subprocess_deploy",
+    srcs = ["run_deploy_jar.sh"],
+    data = [
+        ":tiny_deploy.jar",
+        "@rules_java//toolchains:current_java_runtime",
+    ],
+)

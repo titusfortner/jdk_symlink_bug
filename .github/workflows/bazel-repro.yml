@@ -1,0 +1,103 @@
+name: Bazel JDK classes.jsa symlink repro
+
+# Minimal Bazel reproduction of the EXCEPTION_ACCESS_VIOLATION in jvm.dll when
+# the runfiles JDK's bin\server\classes.jsa is a symlink. Unlike repro.ps1 (no
+# Bazel), this exercises the real Bazel runfiles path that first surfaced the
+# bug. One run executes three experiments so we learn the *minimal* trigger:
+#
+#   1. //:empty_test        pure java_test (runfiles JDK, no subprocess of ours)
+#   2. //:subprocess_version sh_test spawning `java -version` from runfiles
+#   3. //:subprocess_deploy  sh_test spawning `java -jar tiny_deploy.jar`
+#
+# Whichever first crashes is the minimal case to file with rules_java + Azul.
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: bazel-repro
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm Developer Mode (symlinks) is enabled
+        shell: pwsh
+        run: |
+          $k = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+          $v = (Get-ItemProperty -Path $k -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
+          Write-Host "AllowDevelopmentWithoutDevLicense = $v"
+
+      - name: Install Bazelisk
+        shell: pwsh
+        run: choco install bazelisk -y
+
+      # Each experiment runs independently; continue-on-error so a crash in one
+      # does not skip the others. JDK_JAVA_OPTIONS sends every JVM's crash log to
+      # a fixed, stable location we can upload afterwards.
+      - name: "Experiment 1: java_test //:empty_test"
+        id: exp1
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          bazel test //:empty_test `
+            --test_output=streamed `
+            --cache_test_results=no `
+            "--test_env=JDK_JAVA_OPTIONS=-XX:ErrorFile=D:/hs_err_pid%p.log"
+
+      - name: "Experiment 2: sh_test //:subprocess_version"
+        id: exp2
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          bazel test //:subprocess_version `
+            --test_output=streamed `
+            --cache_test_results=no `
+            "--test_env=JDK_JAVA_OPTIONS=-XX:ErrorFile=D:/hs_err_pid%p.log"
+
+      - name: "Experiment 3: sh_test //:subprocess_deploy"
+        id: exp3
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          bazel test //:subprocess_deploy `
+            --test_output=streamed `
+            --cache_test_results=no `
+            "--test_env=JDK_JAVA_OPTIONS=-XX:ErrorFile=D:/hs_err_pid%p.log"
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "empty_test        : ${{ steps.exp1.outcome }}"
+          Write-Host "subprocess_version: ${{ steps.exp2.outcome }}"
+          Write-Host "subprocess_deploy : ${{ steps.exp3.outcome }}"
+          Write-Host "(an 'failure' outcome is the crash signal; check uploaded hs_err logs)"
+
+      - name: Collect Bazel test logs
+        if: always()
+        shell: pwsh
+        run: |
+          $dest = "D:\bazel-testlogs-copy"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $tl = bazel info bazel-testlogs 2>$null
+          if ($tl -and (Test-Path $tl)) {
+            Copy-Item -Recurse -Force "$tl\*" $dest
+            Write-Host "copied test logs from $tl"
+          } else {
+            Write-Host "no bazel-testlogs found"
+          }
+
+      - name: Upload crash artifacts (hs_err + minidumps + test logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-jdk-symlink-repro
+          path: |
+            D:\hs_err_pid*.log
+            D:\*.mdmp
+            D:\bazel-testlogs-copy
+          if-no-files-found: warn

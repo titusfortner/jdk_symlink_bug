@@ -1,0 +1,9 @@
+module(
+    name = "jdk_symlink_bazel_repro",
+    version = "0.0.1",
+)
+
+# Minimal bzlmod setup. The only dependency is rules_java, which is what brings
+# in the remotejdk_25 toolchain (Azul Zulu on Windows) and materializes the JDK
+# into the runfiles symlink tree.
+bazel_dep(name = "rules_java", version = "9.6.1")
