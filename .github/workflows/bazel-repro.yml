@@ -13,6 +13,11 @@ name: Bazel JDK classes.jsa symlink repro
 
 on:
   workflow_dispatch:
+  # Also run on push to the repro branch so the run starts without needing the
+  # workflow to first land on the default branch (a workflow_dispatch API
+  # limitation). Remove once merged.
+  push:
+    branches: [bazel-repro]
 
 defaults:
   run:
