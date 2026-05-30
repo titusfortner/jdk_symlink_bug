@@ -139,12 +139,33 @@ function New-SymlinkTree($Src, $Dst) {
 }
 
 # robocopy is long-path aware, so it can copy a JDK into a deep (>260 internal)
-# destination that Copy-Item would choke on. Exit codes 0-7 mean success.
-function Copy-JdkDeep($Src, $Dst) {
+# destination that Copy-Item would choke on (and is fine for short dests too).
+# Exit codes 0-7 mean success.
+function Copy-Jdk($Src, $Dst) {
   $p = Start-Process robocopy `
     -ArgumentList @("`"$Src`"", "`"$Dst`"", '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:1', '/W:1') `
     -NoNewWindow -PassThru -Wait
   if ($p.ExitCode -ge 8) { throw "robocopy failed copying $Src -> $Dst (exit $($p.ExitCode))" }
+}
+
+# Replace every file under <copy>\<SubRel> with a symlink to the corresponding
+# real file under $Jdk (e.g. symlink all of bin\ or all of lib\). Returns the
+# number of files linked.
+function New-SubtreeSymlinks($CopyRoot, $SubRel) {
+  $n = 0
+  Get-ChildItem -LiteralPath (Join-Path $Jdk $SubRel) -Recurse -Force -File | ForEach-Object {
+    $rel = $_.FullName.Substring($Jdk.Length).TrimStart('\')
+    try { New-FileSymlink (Join-Path $CopyRoot $rel) $_.FullName; $n++ } catch {}
+  }
+  $n
+}
+
+# Copy the real file back over a symlink, so a shared copy can be reused to test
+# one component at a time.
+function Restore-RealFile($CopyRoot, $Rel) {
+  $dst = Join-Path $CopyRoot $Rel
+  if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }
+  Copy-Item -LiteralPath (Join-Path $Jdk $Rel) -Destination $dst -Force
 }
 
 # Run `java <args> -version`, classify the outcome, collect crash artifacts.
@@ -306,7 +327,7 @@ $deepTarget = 200 - ('\bin\java.exe'.Length)   # so <deep>\bin\java.exe ~= 200
 Write-Section "Test C -- DEPTH: real-file JDK copy at a deep path, classes.jsa symlinked"
 $deepReal = New-DeepDir (Join-Path $OutDir 'C-deep-real') $deepTarget
 Write-Host "Deep copy root ($($deepReal.Length) chars): $deepReal"
-Copy-JdkDeep $Jdk $deepReal
+Copy-Jdk $Jdk $deepReal
 $deepRealJava = Join-Path $deepReal 'bin\java.exe'
 $deepRealJsa  = Join-Path $deepReal $relJsa
 New-FileSymlink $deepRealJsa $realJsa
@@ -330,6 +351,63 @@ $treeDeepJava = Join-Path $treeDeep 'bin\java.exe'
 Write-Host "Deep tree root ($($treeDeep.Length) chars): $treeDeep"
 Write-Host "Symlinked $($eStats.Created) files ($($eStats.Skipped) skipped over MAX_PATH); java.exe path is $($treeDeepJava.Length) chars."
 $results += Invoke-JavaProbe -Tag 'E-deep-tree' -JavaExe $treeDeepJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+
+# ---------------------------------------------------------------------------
+# Test F -- localize WHICH symlinked file in the tree is the trigger. Tests D/E
+# proved the symlink TREE crashes where a lone classes.jsa symlink (B) does not;
+# these isolate the responsible component by symlinking one thing at a time on
+# an otherwise real-file copy at a short path (everything else, including a real
+# classes.jsa unless named, stays a regular file):
+#   F1 java.exe        only        F4 jvm.dll + classes.jsa
+#   F2 jvm.dll         only        F5 entire bin\  subtree
+#   F3 lib\modules     only        F6 entire lib\  subtree
+# F1-F4 share one copy (restoring the real file between probes); F5/F6 get their
+# own copies. Whichever minimal set crashes is the precise trigger to file.
+# ---------------------------------------------------------------------------
+$jvmRel = 'bin\server\jvm.dll'
+$modRel = 'lib\modules'
+$exeRel = 'bin\java.exe'
+
+Write-Section "Test F -- localize the trigger file (single components symlinked)"
+$fBase = Join-Path $OutDir 'F-base'
+Copy-Jdk $Jdk $fBase
+$fJava = Join-Path $fBase 'bin\java.exe'
+
+# F1: only java.exe is a symlink.
+New-FileSymlink (Join-Path $fBase $exeRel) (Join-Path $Jdk $exeRel)
+$results += Invoke-JavaProbe -Tag 'F1-symlink-java-exe' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+Restore-RealFile $fBase $exeRel
+
+# F2: only jvm.dll is a symlink.
+New-FileSymlink (Join-Path $fBase $jvmRel) (Join-Path $Jdk $jvmRel)
+$results += Invoke-JavaProbe -Tag 'F2-symlink-jvm-dll' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+Restore-RealFile $fBase $jvmRel
+
+# F3: only lib\modules (the JDK module image) is a symlink.
+New-FileSymlink (Join-Path $fBase $modRel) (Join-Path $Jdk $modRel)
+$results += Invoke-JavaProbe -Tag 'F3-symlink-lib-modules' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+Restore-RealFile $fBase $modRel
+
+# F4: jvm.dll AND classes.jsa are symlinks (the two CDS-mapping participants).
+New-FileSymlink (Join-Path $fBase $jvmRel) (Join-Path $Jdk $jvmRel)
+New-FileSymlink (Join-Path $fBase $relJsa) $realJsa
+$results += Invoke-JavaProbe -Tag 'F4-symlink-jvm+jsa' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+Restore-RealFile $fBase $jvmRel
+Restore-RealFile $fBase $relJsa
+
+# F5: every file under bin\ is a symlink (rest of the JDK real).
+$f5 = Join-Path $OutDir 'F5-bin-tree'
+Copy-Jdk $Jdk $f5
+$n5 = New-SubtreeSymlinks $f5 'bin'
+Write-Host "F5: symlinked $n5 files under bin\."
+$results += Invoke-JavaProbe -Tag 'F5-bin-tree' -JavaExe (Join-Path $f5 'bin\java.exe') -Expect 'OK-or-CRASH' -ExtraArgs @()
+
+# F6: every file under lib\ is a symlink (rest of the JDK real).
+$f6 = Join-Path $OutDir 'F6-lib-tree'
+Copy-Jdk $Jdk $f6
+$n6 = New-SubtreeSymlinks $f6 'lib'
+Write-Host "F6: symlinked $n6 files under lib\."
+$results += Invoke-JavaProbe -Tag 'F6-lib-tree' -JavaExe (Join-Path $f6 'bin\java.exe') -Expect 'OK-or-CRASH' -ExtraArgs @()
 
 # ---------------------------------------------------------------------------
 # Report
@@ -394,6 +472,34 @@ $results |
   Out-String | Write-Host
 Write-Host "ROOT CAUSE: $attribution"
 
+# Finer attribution -- which symlinked file in the tree is the trigger.
+$fExe = Crashed 'F1-symlink-java-exe'
+$fJvm = Crashed 'F2-symlink-jvm-dll'
+$fMod = Crashed 'F3-symlink-lib-modules'
+$fJj  = Crashed 'F4-symlink-jvm+jsa'
+$fBin = Crashed 'F5-bin-tree'
+$fLib = Crashed 'F6-lib-tree'
+
+$singles = @()
+if ($fExe) { $singles += 'java.exe' }
+if ($fJvm) { $singles += 'jvm.dll' }
+if ($fMod) { $singles += 'lib\modules' }
+
+$triggerFile = `
+  if     ($singles.Count -gt 0) { "A single symlinked file is sufficient: $($singles -join ', '). (Symlinking just that file, with the rest of the JDK on real files, crashes.)" }
+  elseif ($fJj)  { "Neither jvm.dll nor classes.jsa alone, but symlinking BOTH jvm.dll AND classes.jsa together triggers it." }
+  elseif ($fBin -and $fLib) { "No single file; symlinking either the whole bin\\ or the whole lib\\ subtree triggers it." }
+  elseif ($fBin) { "No single file; symlinking the whole bin\\ subtree triggers it (lib\\ alone does not)." }
+  elseif ($fLib) { "No single file; symlinking the whole lib\\ subtree triggers it (bin\\ alone does not)." }
+  else           { "No tested subset reproduced -- the trigger needs more of the image symlinked than F covers (the full tree D/E still crashes)." }
+
+Write-Section "Trigger-file localization (single components symlinked)"
+$results |
+  Where-Object Tag -in 'F1-symlink-java-exe','F2-symlink-jvm-dll','F3-symlink-lib-modules','F4-symlink-jvm+jsa','F5-bin-tree','F6-lib-tree' |
+  Format-Table -AutoSize @{L='Tag';E={$_.Tag}}, @{L='Result';E={$_.Result}}, @{L='Frame';E={$_.Frame}} |
+  Out-String | Write-Host
+Write-Host "TRIGGER FILE: $triggerFile"
+
 Write-Host ""
 Write-Host "JDK     : $($realFacts.Path)"
 Write-Host "Artifacts (hs_err logs + minidumps + console output): $OutDir"
@@ -410,13 +516,14 @@ $report = [pscustomobject]@{
   reproduced = $reproduced
   verdict    = $verdict
   attribution = $attribution
+  triggerFile = $triggerFile
   runs       = $results
 }
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'results.json')
 
 # Step summary when running under GitHub Actions.
 if ($env:GITHUB_STEP_SUMMARY) {
-  $lines = @("### $verdict", "", "**Root cause:** $attribution", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
+  $lines = @("### $verdict", "", "**Root cause:** $attribution", "", "**Trigger file:** $triggerFile", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
   foreach ($r in $results) { $lines += "| $($r.Tag) | ``$($r.Command)`` | $($r.Exit) | **$($r.Result)** | $($r.Frame) |" }
   $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 }
