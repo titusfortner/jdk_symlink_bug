@@ -383,9 +383,12 @@ New-FileSymlink (Join-Path $fBase $jvmRel) (Join-Path $Jdk $jvmRel)
 $results += Invoke-JavaProbe -Tag 'F2-symlink-jvm-dll' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
 Restore-RealFile $fBase $jvmRel
 
-# F3: only lib\modules (the JDK module image) is a symlink.
+# F3: only lib\modules (the JDK module image) is a symlink. F7/F8 then characterize
+# whether the crash is CDS-gated by toggling class data sharing on the same config.
 New-FileSymlink (Join-Path $fBase $modRel) (Join-Path $Jdk $modRel)
 $results += Invoke-JavaProbe -Tag 'F3-symlink-lib-modules' -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @()
+$results += Invoke-JavaProbe -Tag 'F7-modules-share-off'   -JavaExe $fJava -Expect 'OK'          -ExtraArgs @('-Xshare:off')
+$results += Invoke-JavaProbe -Tag 'F8-modules-share-on'    -JavaExe $fJava -Expect 'OK-or-CRASH' -ExtraArgs @('-Xshare:on')
 Restore-RealFile $fBase $modRel
 
 # F4: jvm.dll AND classes.jsa are symlinks (the two CDS-mapping participants).
@@ -500,6 +503,15 @@ $results |
   Out-String | Write-Host
 Write-Host "TRIGGER FILE: $triggerFile"
 
+# Is the crash CDS-gated? F3 crashes with default sharing; F7 reruns the same
+# symlinked-lib\modules config with -Xshare:off (CDS disabled), F8 with -Xshare:on.
+$modOff = ($results | Where-Object Tag -eq 'F7-modules-share-off').Result -eq 'OK'
+$workaround = `
+  if     ($fMod -and $modOff) { "CONFIRMED CDS bug: -Xshare:off (class data sharing disabled) avoids the crash on the same symlinked-lib\\modules config. The fault is in mapping/validating the CDS archive (classes.jsa) against the module image." }
+  elseif ($fMod)              { "-Xshare:off did NOT avoid the crash -- the fault may not be purely CDS; inspect F7/F8 and hs_err logs." }
+  else                        { "lib\\modules symlink did not crash on this run; workaround characterization N/A." }
+Write-Host "WORKAROUND: $workaround"
+
 Write-Host ""
 Write-Host "JDK     : $($realFacts.Path)"
 Write-Host "Artifacts (hs_err logs + minidumps + console output): $OutDir"
@@ -517,13 +529,14 @@ $report = [pscustomobject]@{
   verdict    = $verdict
   attribution = $attribution
   triggerFile = $triggerFile
+  workaround  = $workaround
   runs       = $results
 }
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'results.json')
 
 # Step summary when running under GitHub Actions.
 if ($env:GITHUB_STEP_SUMMARY) {
-  $lines = @("### $verdict", "", "**Root cause:** $attribution", "", "**Trigger file:** $triggerFile", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
+  $lines = @("### $verdict", "", "**Root cause:** $attribution", "", "**Trigger file:** $triggerFile", "", "**Workaround:** $workaround", "", "JDK: ``$($realFacts.Path)``", "", "| Tag | Command | Exit | Result | Frame |", "|---|---|---|---|---|")
   foreach ($r in $results) { $lines += "| $($r.Tag) | ``$($r.Command)`` | $($r.Exit) | **$($r.Result)** | $($r.Frame) |" }
   $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 }
