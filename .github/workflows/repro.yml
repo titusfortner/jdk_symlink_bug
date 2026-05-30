@@ -1,19 +1,14 @@
 name: JDK classes.jsa symlink crash repro
 
-# Reproduction attempt for an EXCEPTION_ACCESS_VIOLATION in jvm.dll seen under
-# Bazel (rules_java ships Azul Zulu) on Windows, where the JDK is materialized
-# as a runfiles symlink tree.
+# Reproduction for an EXCEPTION_ACCESS_VIOLATION in jvm.dll on Windows when the
+# default CDS archive (bin\server\classes.jsa) is a symbolic link instead of a
+# regular file. First hit under Bazel (rules_java ships Azul Zulu), whose
+# runfiles tree materializes the JDK as symlinks. Bazel is NOT required here:
+# repro.ps1 reproduces it with a plain JDK + a symlink.
 #
-# Two link modes are tested to isolate the trigger:
-#   jsa  - copy the whole JDK, replace ONLY bin\server\classes.jsa with a symlink
-#          pointing back at the real archive (the original minimal hypothesis).
-#   tree - mirror the ENTIRE JDK as a symlink tree: every file (java.exe,
-#          jvm.dll, classes.jsa, ...) is a symlink to the real file. This is what
-#          a Bazel runfiles tree actually looks like.
-#
-# For each mode: run `java -Xshare:on -version` (expected to crash if reproduced)
-# then `java -Xshare:off -version` (expected to succeed). hs_err + minidump are
-# uploaded as artifacts.
+# The single source of truth is repro.ps1. A run is only counted as a CRASH when
+# a real access violation (hs_err with EXCEPTION_ACCESS_VIOLATION) is written, so
+# a clean "-Xshare:on cannot map archive" abort is never misreported as the bug.
 
 on:
   workflow_dispatch:
@@ -24,154 +19,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ["temurin", "zulu"]
+        distribution: ["temurin", "zulu", "microsoft"]
         java: ["21", "25"]
-        linkmode: ["jsa", "tree"]
-    name: "${{ matrix.distribution }} ${{ matrix.java }} / ${{ matrix.linkmode }}"
+    name: "${{ matrix.distribution }} ${{ matrix.java }}"
     steps:
+      - uses: actions/checkout@v4
+
       - name: Set up ${{ matrix.distribution }} JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: ${{ matrix.distribution }}
           java-version: ${{ matrix.java }}
 
-      - name: Show JDK info
+      - name: Run repro
         shell: pwsh
-        run: |
-          Write-Host "JAVA_HOME = $env:JAVA_HOME"
-          & "$env:JAVA_HOME\bin\java.exe" -version
+        run: ./repro.ps1 -OutDir "C:\cds-repro"
 
-      - name: Build link JDK (mode=${{ matrix.linkmode }})
-        id: build
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $real = $env:JAVA_HOME
-          $link = "C:\jdk-link"
-          $mode = "${{ matrix.linkmode }}"
-
-          # On Windows the server-VM CDS archive lives at bin\server\classes.jsa.
-          $realJsa = Join-Path $real "bin\server\classes.jsa"
-          if (-not (Test-Path $realJsa)) {
-            $found = Get-ChildItem -Path $real -Recurse -Filter classes.jsa -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $realJsa = $found.FullName }
-          }
-          if (-not (Test-Path $realJsa)) {
-            Write-Host "::warning::No default CDS archive ships with this JDK — nothing to symlink."
-            "has-cds=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            exit 0
-          }
-
-          if ($mode -eq "jsa") {
-            Write-Host "Copying real JDK ($real) -> $link"
-            Copy-Item -Recurse -Force $real $link
-            $linkJsa = $realJsa.Replace($real, $link)
-            Remove-Item $linkJsa -Force
-            New-Item -ItemType SymbolicLink -Path $linkJsa -Target $realJsa | Out-Null
-          }
-          else {
-            Write-Host "Mirroring real JDK as a symlink tree -> $link"
-            function Mirror-Tree($src, $dst) {
-              New-Item -ItemType Directory -Force -Path $dst | Out-Null
-              foreach ($entry in Get-ChildItem -LiteralPath $src -Force) {
-                $t = Join-Path $dst $entry.Name
-                if ($entry.PSIsContainer) { Mirror-Tree $entry.FullName $t }
-                else { New-Item -ItemType SymbolicLink -Path $t -Target $entry.FullName | Out-Null }
-              }
-            }
-            Mirror-Tree $real $link
-            $linkJsa = $realJsa.Replace($real, $link)
-          }
-
-          $item = Get-Item $linkJsa -Force
-          Write-Host "classes.jsa -> Attributes=$($item.Attributes) LinkType=$($item.LinkType) Target=$($item.Target)"
-          if ($item.LinkType -ne "SymbolicLink") { throw "classes.jsa is not a symlink!" }
-          if (-not ($linkJsa.ToLower().EndsWith("server\classes.jsa"))) {
-            throw "Symlinked archive is not at <vm>\server\classes.jsa: $linkJsa"
-          }
-          if ($mode -eq "tree") {
-            $je = Get-Item "$link\bin\java.exe" -Force
-            Write-Host "java.exe -> LinkType=$($je.LinkType)"
-            if ($je.LinkType -ne "SymbolicLink") { throw "tree mode: java.exe is not a symlink!" }
-          }
-
-          New-Item -ItemType Directory -Force -Path "C:\crash" | Out-Null
-          "has-cds=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Run java -Xshare:on -version (EXPECTED TO CRASH)
-        id: crash
-        if: steps.build.outputs.has-cds == 'true'
-        continue-on-error: true
-        working-directory: C:\crash
-        shell: pwsh
-        run: |
-          $java = "${{ steps.build.outputs.java }}"
-          Write-Host "Running: $java -Xshare:on -version"
-          & $java -Xshare:on -version
-          $code = $LASTEXITCODE
-          Write-Host "Exit code: $code"
-          "exit-code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Show hs_err log
-        if: always() && steps.build.outputs.has-cds == 'true'
-        working-directory: C:\crash
-        shell: pwsh
-        run: |
-          $logs = Get-ChildItem -Path . -Filter "hs_err_pid*.log" -ErrorAction SilentlyContinue
-          if (-not $logs) {
-            Write-Host "No hs_err log written."
-          } else {
-            foreach ($l in $logs) {
-              Write-Host "===== $($l.Name) (first 80 lines) ====="
-              Get-Content $l.FullName -TotalCount 80
-            }
-          }
-          Get-ChildItem -Path . -Filter "*.mdmp" -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "Minidump: $($_.Name) ($($_.Length) bytes)" }
-
-      - name: Workaround — java -Xshare:off -version (EXPECTED TO SUCCEED)
-        id: workaround
-        if: steps.build.outputs.has-cds == 'true'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $java = "${{ steps.build.outputs.java }}"
-          Write-Host "Running: $java -Xshare:off -version"
-          & $java -Xshare:off -version
-          $code = $LASTEXITCODE
-          Write-Host "Exit code: $code"
-          "exit-code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload crash artifacts (hs_err + minidump)
-        if: always() && steps.build.outputs.has-cds == 'true'
+      - name: Upload crash artifacts (hs_err + minidump + results)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jdk-crash-${{ matrix.distribution }}-${{ matrix.java }}-${{ matrix.linkmode }}
+          name: jdk-cds-symlink-${{ matrix.distribution }}-${{ matrix.java }}
           path: |
-            C:\crash\hs_err_pid*.log
-            C:\crash\*.mdmp
+            C:\cds-repro\hs_err_*.log
+            C:\cds-repro\*.mdmp
+            C:\cds-repro\results.json
+            C:\cds-repro\*.txt
           if-no-files-found: warn
-
-      - name: Verdict
-        if: always()
-        shell: pwsh
-        run: |
-          $hasCds = "${{ steps.build.outputs.has-cds }}"
-          $crash  = "${{ steps.crash.outputs.exit-code }}"
-          $work   = "${{ steps.workaround.outputs.exit-code }}"
-
-          if ($hasCds -ne "true") {
-            $verdict = "N/A - JDK ships no default CDS archive"
-          } elseif ($crash -ne "0" -and $work -eq "0") {
-            $verdict = "REPRODUCED - -Xshare:on crashed (exit $crash), -Xshare:off succeeded"
-          } elseif ($crash -eq "0") {
-            $verdict = "NOT reproduced - -Xshare:on exited cleanly"
-          } else {
-            $verdict = "Inconclusive - crash exit=$crash, workaround exit=$work"
-          }
-
-          $label = "${{ matrix.distribution }} ${{ matrix.java }} / ${{ matrix.linkmode }}"
-          Write-Host ("RESULT | {0} | {1}" -f $label, $verdict)
-          "## ${label}: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

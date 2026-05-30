@@ -4,57 +4,63 @@
 (Windows: `bin\server\classes.jsa`) is a **symbolic link** instead of a regular
 file. Disabling class data sharing (`-Xshare:off`) works around it.
 
-Originally observed on **Azul Zulu** JDK 21/25 (Windows, via Bazel's
-`rules_java` runfiles). This repo runs the repro across vendors
-(`temurin`, `zulu`, `microsoft`) and versions (17/21/25) to pin down whether it
-is an OpenJDK-wide bug or vendor-specific.
+First observed on **Azul Zulu** JDK 21/25 (Windows, via Bazel's `rules_java`
+runfiles, which materialize the JDK as a symlink tree). This repo removes Bazel
+from the picture and reproduces it with a plain JDK + one symlink.
 
-> Note: on Windows the server-VM CDS archive lives at `bin\server\classes.jsa`
+> On Windows the server-VM CDS archive lives at `bin\server\classes.jsa`
 > (on Linux/macOS it's `lib/server/classes.jsa`).
+
+## For a JDK maintainer
+
+- **[`BUG_REPORT.md`](BUG_REPORT.md)** — the writeup to file/forward: summary,
+  affected configs, what the field minidump showed, exact repro steps, expected
+  vs actual, workaround, and which artifacts to attach.
+- **[`repro.ps1`](repro.ps1)** — a self-contained Windows repro (no Bazel). It
+  isolates the single variable (regular file vs symlink) two ways and only
+  reports `CRASH` when a real access violation (`hs_err`) is written — a clean
+  `-Xshare:on` "cannot map archive" abort is reported separately and never
+  mistaken for the bug.
 
 ## What the repro proves
 
-At startup the JVM memory-maps the default CDS archive `lib/server/classes.jsa`.
-If that single file is swapped for a symlink pointing at a byte-identical real
-archive — nothing else changed — `java -version` crashes. `-Xshare:off` avoids
-it because CDS never opens the archive. One variable: regular file vs symlink.
+At startup the JVM memory-maps the default CDS archive. If that one file is
+swapped for a symlink pointing at a byte-identical real archive — nothing else
+changed — `java -version` crashes. `-Xshare:off` avoids it because the archive
+is never mapped. Same `java.exe`, same jar, same bytes (matching SHA-256); the
+only variable is **regular file vs symlink**.
+
+## Reproduce locally (Windows 10+, Developer Mode or admin)
+
+```powershell
+# JAVA_HOME points at a JDK that ships a default classes.jsa.
+pwsh ./repro.ps1
+# Artifacts (hs_err + minidump + results.json) land in .\cds-symlink-artifacts
+```
+
+Minimal manual version:
+
+```powershell
+$real = $env:JAVA_HOME
+$link = "C:\jdk-copy"
+Copy-Item -Recurse -Force $real $link
+$jsa = "$link\bin\server\classes.jsa"
+Remove-Item $jsa
+New-Item -ItemType SymbolicLink -Path $jsa -Target "$real\bin\server\classes.jsa"
+
+& "$link\bin\java.exe" -version             # EXCEPTION_ACCESS_VIOLATION, hs_err written
+& "$link\bin\java.exe" -Xshare:off -version # succeeds
+```
 
 ## Reproduce in CI
 
 Run the **JDK classes.jsa symlink crash repro** workflow from the Actions tab
-(`workflow_dispatch`). For each vendor×version in the matrix (temurin/zulu/
-microsoft × 17/21/25) on a `windows-latest` runner it:
+(`workflow_dispatch`). For each vendor×version (temurin/zulu/microsoft × 21/25)
+on `windows-latest` it runs `repro.ps1` and uploads `hs_err_*.log`, `*.mdmp`,
+`results.json`, and per-run console output as
+`jdk-cds-symlink-<vendor>-<version>`. A trustworthy `REPRODUCED` verdict
+requires the byte-identical real-file runs and the `-Xshare:off` workaround to
+pass while the symlink runs crash.
 
-1. Installs the JDK.
-2. Copies it, then replaces *only* the copy's `bin\server\classes.jsa` with a
-   symlink pointing back at the original.
-3. Runs `java -Xshare:on -version` → expected to crash, writing
-   `hs_err_pid*.log` and a `*.mdmp`.
-4. Runs `java -Xshare:off -version` → expected to succeed.
-5. Uploads the `hs_err` log and minidump as `jdk-crash-<vendor>-<version>`.
-6. Prints a verdict (REPRODUCED / NOT reproduced / N/A) to the job summary.
-
-JDKs that ship no default CDS archive report **N/A** — there is no
-`classes.jsa` to symlink.
-
-## Reproduce locally (Windows 10+, developer mode or admin)
-
-```powershell
-# Setup: have a JDK at C:\jdk-real
-$real = "C:\jdk-real"
-
-# Make a parallel JDK directory, replace ONLY classes.jsa with a symlink
-$link = "C:\jdk-link"
-Copy-Item -Recurse $real $link
-$linkJsa = "$link\bin\server\classes.jsa"
-Remove-Item $linkJsa
-New-Item -ItemType SymbolicLink -Path $linkJsa -Target "$real\bin\server\classes.jsa"
-
-# Crashes: EXCEPTION_ACCESS_VIOLATION in jvm.dll, hs_err written.
-& "$link\bin\java.exe" -Xshare:on -version
-
-# Workaround: succeeds.
-& "$link\bin\java.exe" -Xshare:off -version
-```
-
-Attach the resulting `hs_err_pid*.log` and `*.mdmp` to the bug report.
+JDKs that ship no default CDS archive cannot be tested (nothing to symlink); run
+`java -Xshare:dump` first or pick a JDK that ships one.
