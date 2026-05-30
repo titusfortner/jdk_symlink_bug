@@ -1,0 +1,169 @@
+name: JDK classes.jsa symlink crash repro
+
+# Minimal reproduction of an EXCEPTION_ACCESS_VIOLATION in jvm.dll when the
+# CDS archive (classes.jsa) is a symbolic link rather than a regular file.
+#
+# What this proves: at startup the JVM memory-maps the default CDS archive
+# (lib/server/classes.jsa). If that single file is replaced by a symlink that
+# points at a byte-identical real archive, `java -version` crashes. Disabling
+# class data sharing (-Xshare:off) is the workaround because CDS never opens the
+# archive. Only one variable changes between crash and success: regular file vs
+# symlink.
+#
+# Repro recipe (no Bazel, no Selenium — just JDK + a symlink + a command):
+#   1. Take a real JDK.
+#   2. Make a parallel copy of it.
+#   3. In the copy, replace ONLY lib/server/classes.jsa with a symlink that
+#      points back at the real JDK's classes.jsa.
+#   4. Run `java -Xshare:on -version` from the copy -> crashes (hs_err + minidump).
+#   5. Run `java -Xshare:off -version`              -> succeeds (CDS disabled).
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: setup-java distribution (temurin, zulu, microsoft, ...)
+        default: "temurin"
+        required: false
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["11", "17", "21", "25"]
+    name: "JDK ${{ matrix.java }}"
+    steps:
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.distribution || 'temurin' }}
+          java-version: ${{ matrix.java }}
+
+      - name: Show JDK info
+        shell: pwsh
+        run: |
+          Write-Host "JAVA_HOME = $env:JAVA_HOME"
+          & "$env:JAVA_HOME\bin\java.exe" -version
+
+      - name: Build symlinked JDK copy
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $real = $env:JAVA_HOME
+          $link = "C:\jdk-link"
+
+          Write-Host "Copying real JDK ($real) -> $link"
+          Copy-Item -Recurse -Force $real $link
+
+          # The server-VM CDS archive normally lives at lib/server/classes.jsa.
+          # Fall back to a recursive search in case the layout differs.
+          $linkJsa = Join-Path $link "lib\server\classes.jsa"
+          if (-not (Test-Path $linkJsa)) {
+            $found = Get-ChildItem -Path $link -Recurse -Filter classes.jsa -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $linkJsa = $found.FullName }
+          }
+
+          if (-not (Test-Path $linkJsa)) {
+            Write-Host "::warning::No default CDS archive (classes.jsa) ships with this JDK — nothing to symlink."
+            "has-cds=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          $realJsa = $linkJsa.Replace($link, $real)
+          Write-Host "Replacing copy's CDS archive with a symlink:"
+          Write-Host "  link   : $linkJsa"
+          Write-Host "  target : $realJsa"
+
+          Remove-Item $linkJsa -Force
+          New-Item -ItemType SymbolicLink -Path $linkJsa -Target $realJsa | Out-Null
+
+          # Confirm it really is a symlink.
+          $item = Get-Item $linkJsa -Force
+          Write-Host "Attributes: $($item.Attributes)"
+          Write-Host "LinkType  : $($item.LinkType)"
+          Write-Host "Target    : $($item.Target)"
+          if ($item.LinkType -ne "SymbolicLink") { throw "classes.jsa is not a symlink!" }
+
+          New-Item -ItemType Directory -Force -Path "C:\crash" | Out-Null
+          "has-cds=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run java -Xshare:on -version (EXPECTED TO CRASH)
+        id: crash
+        if: steps.build.outputs.has-cds == 'true'
+        continue-on-error: true
+        working-directory: C:\crash
+        shell: pwsh
+        run: |
+          $java = "${{ steps.build.outputs.java }}"
+          Write-Host "Running: $java -Xshare:on -version"
+          & $java -Xshare:on -version
+          $code = $LASTEXITCODE
+          Write-Host "Exit code: $code"
+          "exit-code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Show hs_err log
+        if: always() && steps.build.outputs.has-cds == 'true'
+        working-directory: C:\crash
+        shell: pwsh
+        run: |
+          $logs = Get-ChildItem -Path . -Filter "hs_err_pid*.log" -ErrorAction SilentlyContinue
+          if (-not $logs) {
+            Write-Host "No hs_err log written."
+          } else {
+            foreach ($l in $logs) {
+              Write-Host "===== $($l.Name) (first 80 lines) ====="
+              Get-Content $l.FullName -TotalCount 80
+            }
+          }
+          Get-ChildItem -Path . -Filter "*.mdmp" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "Minidump: $($_.Name) ($($_.Length) bytes)" }
+
+      - name: Workaround — java -Xshare:off -version (EXPECTED TO SUCCEED)
+        id: workaround
+        if: steps.build.outputs.has-cds == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $java = "${{ steps.build.outputs.java }}"
+          Write-Host "Running: $java -Xshare:off -version"
+          & $java -Xshare:off -version
+          $code = $LASTEXITCODE
+          Write-Host "Exit code: $code"
+          "exit-code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload crash artifacts (hs_err + minidump)
+        if: always() && steps.build.outputs.has-cds == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-crash-artifacts-${{ matrix.java }}
+          path: |
+            C:\crash\hs_err_pid*.log
+            C:\crash\*.mdmp
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          $hasCds = "${{ steps.build.outputs.has-cds }}"
+          $crash  = "${{ steps.crash.outputs.exit-code }}"
+          $work   = "${{ steps.workaround.outputs.exit-code }}"
+
+          if ($hasCds -ne "true") {
+            $verdict = "⚪ N/A — JDK ships no default CDS archive"
+          } elseif ($crash -ne "0" -and $work -eq "0") {
+            $verdict = "🔴 REPRODUCED — ``-Xshare:on`` crashed (exit $crash), ``-Xshare:off`` succeeded"
+          } elseif ($crash -eq "0") {
+            $verdict = "🟢 NOT reproduced — ``-Xshare:on`` exited cleanly"
+          } else {
+            $verdict = "❓ Inconclusive — crash exit=$crash, workaround exit=$work"
+          }
+
+          $row = "| ${{ matrix.java }} | $verdict |"
+          Write-Host $row
+          "## JDK ${{ matrix.java }}: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
