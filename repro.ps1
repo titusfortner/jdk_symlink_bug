@@ -1,22 +1,26 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Minimal, self-contained reproduction of a JVM EXCEPTION_ACCESS_VIOLATION on
-  Windows when the CDS archive (classes.jsa) is a symbolic link rather than a
-  regular file.
+  Self-contained reproduction of a JVM startup failure on Windows when a JDK file
+  is a symbolic link. Pins the trigger to the runtime module image lib\modules.
 
 .DESCRIPTION
-  Class Data Sharing memory-maps the default archive at startup
-  (Windows: <jdk>\bin\server\classes.jsa). When that file is a Windows symbolic
-  link pointing at a byte-identical real archive -- nothing else changed -- the
-  JVM crashes with an access violation inside jvm.dll during archive mapping.
-  Replacing the symlink with the real file fixes it; -Xshare:off also avoids it
-  because the archive is never mapped.
+  CONCLUSION (CI-confirmed, vendor-independent, JDK 21 & 25): the JVM fails to
+  start when <jdk>\lib\modules (the runtime module image / jimage) is a symbolic
+  link to a byte-identical real image. With class data sharing on (the default)
+  it crashes with EXCEPTION_ACCESS_VIOLATION (null read) in jvm.dll during VM
+  init; with -Xshare:off it does not crash but still fails
+  (NoClassDefFoundError: java.lang.Object). So -Xshare:off is NOT a workaround;
+  CDS only changes the symptom. Making lib\modules a regular file fixes it.
 
-  This was first hit under Bazel on Windows, whose runfiles tree materializes the
-  JDK as symlinks (classes.jsa becomes a link back to the external cache). This
-  script removes Bazel from the picture and isolates the single variable
-  (regular file vs symlink) two independent ways:
+  This corrects the original hypothesis (that the CDS archive classes.jsa being a
+  symlink was the cause): Tests A/B below symlink only classes.jsa and DO NOT
+  crash. The trigger is isolated to lib\modules by Test F.
+
+  First hit under Bazel on Windows, whose runfiles tree materializes the whole
+  JDK -- including lib\modules -- as symlinks back to the external cache. This
+  script removes Bazel from the picture. It keeps the original classes.jsa probes
+  (Tests A/B) as negative controls, then isolates the real trigger:
 
     Test A -- explicit archive via -XX:SharedArchiveFile=<symlink>
               (most surgical: same java.exe, one flag value changes)
