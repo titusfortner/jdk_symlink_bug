@@ -1,22 +1,19 @@
 name: JDK classes.jsa symlink crash repro
 
-# Minimal reproduction of an EXCEPTION_ACCESS_VIOLATION in jvm.dll when the
-# CDS archive (classes.jsa) is a symbolic link rather than a regular file.
+# Reproduction attempt for an EXCEPTION_ACCESS_VIOLATION in jvm.dll seen under
+# Bazel (rules_java ships Azul Zulu) on Windows, where the JDK is materialized
+# as a runfiles symlink tree.
 #
-# What this proves: at startup the JVM memory-maps the default CDS archive
-# (lib/server/classes.jsa). If that single file is replaced by a symlink that
-# points at a byte-identical real archive, `java -version` crashes. Disabling
-# class data sharing (-Xshare:off) is the workaround because CDS never opens the
-# archive. Only one variable changes between crash and success: regular file vs
-# symlink.
+# Two link modes are tested to isolate the trigger:
+#   jsa  - copy the whole JDK, replace ONLY bin\server\classes.jsa with a symlink
+#          pointing back at the real archive (the original minimal hypothesis).
+#   tree - mirror the ENTIRE JDK as a symlink tree: every file (java.exe,
+#          jvm.dll, classes.jsa, ...) is a symlink to the real file. This is what
+#          a Bazel runfiles tree actually looks like.
 #
-# Repro recipe (no Bazel, no Selenium — just JDK + a symlink + a command):
-#   1. Take a real JDK.
-#   2. Make a parallel copy of it.
-#   3. In the copy, replace ONLY lib/server/classes.jsa with a symlink that
-#      points back at the real JDK's classes.jsa.
-#   4. Run `java -Xshare:on -version` from the copy -> crashes (hs_err + minidump).
-#   5. Run `java -Xshare:off -version`              -> succeeds (CDS disabled).
+# For each mode: run `java -Xshare:on -version` (expected to crash if reproduced)
+# then `java -Xshare:off -version` (expected to succeed). hs_err + minidump are
+# uploaded as artifacts.
 
 on:
   workflow_dispatch:
@@ -27,13 +24,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: ["17", "21", "25"]
-        distribution: ["temurin", "zulu", "microsoft"]
-        exclude:
-          # Microsoft Build of OpenJDK doesn't publish a 25 build in setup-java.
-          - java: "25"
-            distribution: "microsoft"
-    name: "${{ matrix.distribution }} JDK ${{ matrix.java }}"
+        distribution: ["temurin", "zulu"]
+        java: ["21", "25"]
+        linkmode: ["jsa", "tree"]
+    name: "${{ matrix.distribution }} ${{ matrix.java }} / ${{ matrix.linkmode }}"
     steps:
       - name: Set up ${{ matrix.distribution }} JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
@@ -47,54 +41,59 @@ jobs:
           Write-Host "JAVA_HOME = $env:JAVA_HOME"
           & "$env:JAVA_HOME\bin\java.exe" -version
 
-      - name: Build symlinked JDK copy
+      - name: Build link JDK (mode=${{ matrix.linkmode }})
         id: build
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $real = $env:JAVA_HOME
           $link = "C:\jdk-link"
+          $mode = "${{ matrix.linkmode }}"
 
-          Write-Host "Copying real JDK ($real) -> $link"
-          Copy-Item -Recurse -Force $real $link
-
-          # On Windows the server-VM CDS archive lives at bin\server\classes.jsa
-          # (on Linux/macOS it's lib/server/classes.jsa). Try both, then fall
-          # back to a recursive search so we never silently skip.
-          $candidates = @(
-            (Join-Path $link "bin\server\classes.jsa"),
-            (Join-Path $link "lib\server\classes.jsa")
-          )
-          $linkJsa = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $linkJsa) {
-            $found = Get-ChildItem -Path $link -Recurse -Filter classes.jsa -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $linkJsa = $found.FullName }
+          # On Windows the server-VM CDS archive lives at bin\server\classes.jsa.
+          $realJsa = Join-Path $real "bin\server\classes.jsa"
+          if (-not (Test-Path $realJsa)) {
+            $found = Get-ChildItem -Path $real -Recurse -Filter classes.jsa -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $realJsa = $found.FullName }
           }
-
-          if (-not $linkJsa) {
-            Write-Host "::warning::No default CDS archive (classes.jsa) ships with this JDK — nothing to symlink."
+          if (-not (Test-Path $realJsa)) {
+            Write-Host "::warning::No default CDS archive ships with this JDK — nothing to symlink."
             "has-cds=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             "java=$link\bin\java.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
-          Write-Host "Found CDS archive to replace: $linkJsa"
 
-          $realJsa = $linkJsa.Replace($link, $real)
-          Write-Host "Replacing copy's CDS archive with a symlink:"
-          Write-Host "  link   : $linkJsa"
-          Write-Host "  target : $realJsa"
+          if ($mode -eq "jsa") {
+            Write-Host "Copying real JDK ($real) -> $link"
+            Copy-Item -Recurse -Force $real $link
+            $linkJsa = $realJsa.Replace($real, $link)
+            Remove-Item $linkJsa -Force
+            New-Item -ItemType SymbolicLink -Path $linkJsa -Target $realJsa | Out-Null
+          }
+          else {
+            Write-Host "Mirroring real JDK as a symlink tree -> $link"
+            function Mirror-Tree($src, $dst) {
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              foreach ($entry in Get-ChildItem -LiteralPath $src -Force) {
+                $t = Join-Path $dst $entry.Name
+                if ($entry.PSIsContainer) { Mirror-Tree $entry.FullName $t }
+                else { New-Item -ItemType SymbolicLink -Path $t -Target $entry.FullName | Out-Null }
+              }
+            }
+            Mirror-Tree $real $link
+            $linkJsa = $realJsa.Replace($real, $link)
+          }
 
-          Remove-Item $linkJsa -Force
-          New-Item -ItemType SymbolicLink -Path $linkJsa -Target $realJsa | Out-Null
-
-          # Confirm it really is a symlink.
           $item = Get-Item $linkJsa -Force
-          Write-Host "Attributes: $($item.Attributes)"
-          Write-Host "LinkType  : $($item.LinkType)"
-          Write-Host "Target    : $($item.Target)"
+          Write-Host "classes.jsa -> Attributes=$($item.Attributes) LinkType=$($item.LinkType) Target=$($item.Target)"
           if ($item.LinkType -ne "SymbolicLink") { throw "classes.jsa is not a symlink!" }
           if (-not ($linkJsa.ToLower().EndsWith("server\classes.jsa"))) {
             throw "Symlinked archive is not at <vm>\server\classes.jsa: $linkJsa"
+          }
+          if ($mode -eq "tree") {
+            $je = Get-Item "$link\bin\java.exe" -Force
+            Write-Host "java.exe -> LinkType=$($je.LinkType)"
+            if ($je.LinkType -ne "SymbolicLink") { throw "tree mode: java.exe is not a symlink!" }
           }
 
           New-Item -ItemType Directory -Force -Path "C:\crash" | Out-Null
@@ -149,7 +148,7 @@ jobs:
         if: always() && steps.build.outputs.has-cds == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: jdk-crash-${{ matrix.distribution }}-${{ matrix.java }}
+          name: jdk-crash-${{ matrix.distribution }}-${{ matrix.java }}-${{ matrix.linkmode }}
           path: |
             C:\crash\hs_err_pid*.log
             C:\crash\*.mdmp
@@ -164,15 +163,15 @@ jobs:
           $work   = "${{ steps.workaround.outputs.exit-code }}"
 
           if ($hasCds -ne "true") {
-            $verdict = "⚪ N/A — JDK ships no default CDS archive"
+            $verdict = "N/A - JDK ships no default CDS archive"
           } elseif ($crash -ne "0" -and $work -eq "0") {
-            $verdict = "🔴 REPRODUCED — ``-Xshare:on`` crashed (exit $crash), ``-Xshare:off`` succeeded"
+            $verdict = "REPRODUCED - -Xshare:on crashed (exit $crash), -Xshare:off succeeded"
           } elseif ($crash -eq "0") {
-            $verdict = "🟢 NOT reproduced — ``-Xshare:on`` exited cleanly"
+            $verdict = "NOT reproduced - -Xshare:on exited cleanly"
           } else {
-            $verdict = "❓ Inconclusive — crash exit=$crash, workaround exit=$work"
+            $verdict = "Inconclusive - crash exit=$crash, workaround exit=$work"
           }
 
-          $label = "${{ matrix.distribution }} JDK ${{ matrix.java }}"
-          Write-Host "| $label | $verdict |"
-          "## $label: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $label = "${{ matrix.distribution }} ${{ matrix.java }} / ${{ matrix.linkmode }}"
+          Write-Host ("RESULT | {0} | {1}" -f $label, $verdict)
+          "## ${label}: $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
