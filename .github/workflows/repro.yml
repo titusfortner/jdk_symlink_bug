@@ -1,14 +1,21 @@
-name: JDK classes.jsa symlink crash repro
+name: JDK lib\modules symlink crash
 
-# Reproduction for an EXCEPTION_ACCESS_VIOLATION in jvm.dll on Windows when the
-# default CDS archive (bin\server\classes.jsa) is a symbolic link instead of a
-# regular file. First hit under Bazel (rules_java ships Azul Zulu), whose
-# runfiles tree materializes the JDK as symlinks. Bazel is NOT required here:
-# repro.ps1 reproduces it with a plain JDK + a symlink.
+# Minimal, self-contained reproduction (no Bazel) of an EXCEPTION_ACCESS_VIOLATION
+# in jvm.dll on Windows when the JDK runtime module image lib\modules (the jimage)
+# is a symbolic link instead of a regular file.
 #
-# The single source of truth is repro.ps1. A run is only counted as a CRASH when
-# a real access violation (hs_err with EXCEPTION_ACCESS_VIOLATION) is written, so
-# a clean "-Xshare:on cannot map archive" abort is never misreported as the bug.
+# The whole repro is the inline pwsh step below: copy a stock JDK, replace ONLY
+# lib\modules with a symlink to the real image, then `java -version`. The single
+# variable is regular-file-vs-symlink.
+#
+# Matrix is one distribution (Temurin) across Java versions to answer "is this a
+# regression?". lib\modules has existed since Java 9 (Project Jigsaw); if every
+# version crashes, the bug is long-standing rather than newly introduced.
+#
+# Verdict: green = the crash reproduced (this repo's purpose); red = it did not
+# (that version tolerates a symlinked lib\modules -- a regression boundary worth
+# noting). Only a real EXCEPTION_ACCESS_VIOLATION hs_err counts as a crash, so a
+# clean abort is never misreported.
 
 on:
   workflow_dispatch:
@@ -19,30 +26,73 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ["temurin", "zulu", "microsoft"]
-        java: ["21", "25"]
-    name: "${{ matrix.distribution }} ${{ matrix.java }}"
+        java: ["11", "17", "21", "25"]
+    name: "Temurin ${{ matrix.java }}"
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up ${{ matrix.distribution }} JDK ${{ matrix.java }}
+      - name: Set up Temurin JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
-          distribution: ${{ matrix.distribution }}
+          distribution: temurin
           java-version: ${{ matrix.java }}
 
-      - name: Run repro
+      - name: Reproduce (symlink lib\modules, then java -version)
         shell: pwsh
-        run: ./repro.ps1 -OutDir "C:\cds-repro"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native exit codes must NOT throw: robocopy returns 1 on a normal copy
+          # and a crashing java returns the access-violation code -- both are
+          # expected here and are checked explicitly below.
+          $PSNativeCommandUseErrorActionPreference = $false
 
-      - name: Upload crash artifacts (hs_err + minidump + results)
+          $jdk = $env:JAVA_HOME
+          $realMod = Join-Path $jdk 'lib\modules'
+          if (-not (Test-Path $realMod)) { throw "no lib\modules under $jdk (pre-module JDK?)" }
+
+          # Copy the JDK, then flip ONLY lib\modules to a symlink to the real image.
+          $copy = 'C:\jdk-copy'
+          robocopy $jdk $copy /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
+
+          $copyMod = Join-Path $copy 'lib\modules'
+          Remove-Item $copyMod -Force
+          New-Item -ItemType SymbolicLink -Path $copyMod -Target $realMod | Out-Null
+          if ((Get-Item $copyMod -Force).LinkType -ne 'SymbolicLink') {
+            throw "lib\modules is not a SymbolicLink -- need Developer Mode or an elevated shell."
+          }
+          Write-Host "lib\modules is now a symlink -> $realMod"
+
+          New-Item -ItemType Directory -Force -Path 'C:\hs' | Out-Null
+          $err = 'C:\hs\hs_err_pid%p.log'
+          $java = Join-Path $copy 'bin\java.exe'
+
+          Write-Host "== java -version (default sharing) =="
+          & $java "-XX:ErrorFile=$err" -version
+          Write-Host "exit=$LASTEXITCODE"
+
+          $hs = @(Get-ChildItem 'C:\hs' -Filter 'hs_err_*.log' -ErrorAction SilentlyContinue |
+                  Where-Object { Select-String -Path $_.FullName -Pattern 'EXCEPTION_ACCESS_VIOLATION' -Quiet })
+          $crashed = $hs.Count -gt 0
+
+          $sum = if ($crashed) {
+            "**CRASH** — ``EXCEPTION_ACCESS_VIOLATION`` in jvm.dll with a symlinked ``lib\modules``."
+          } else {
+            "**no crash** — this version tolerates a symlinked ``lib\modules`` (regression boundary)."
+          }
+          "## Temurin ${{ matrix.java }}`n`n$sum" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if (-not $crashed) {
+            Write-Error "NOT reproduced on Temurin ${{ matrix.java }} (no EXCEPTION_ACCESS_VIOLATION hs_err)."
+            exit 1
+          }
+          Write-Host "REPRODUCED on Temurin ${{ matrix.java }}."
+          # Pin success: java left a nonzero $LASTEXITCODE from the crash, which
+          # would otherwise sink the step.
+          exit 0
+
+      - name: Upload hs_err log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jdk-cds-symlink-${{ matrix.distribution }}-${{ matrix.java }}
-          path: |
-            C:\cds-repro\hs_err_*.log
-            C:\cds-repro\*.mdmp
-            C:\cds-repro\results.json
-            C:\cds-repro\*.txt
+          name: hs_err-temurin-${{ matrix.java }}
+          path: C:\hs\hs_err_*.log
           if-no-files-found: warn

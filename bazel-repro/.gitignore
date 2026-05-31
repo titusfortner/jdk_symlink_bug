@@ -1,3 +1,0 @@
-# Bazel convenience symlinks and generated outputs
-/bazel-*
-MODULE.bazel.lock

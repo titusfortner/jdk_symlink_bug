@@ -35,8 +35,8 @@ that flips behavior is **regular file vs symlink**.
 - **Trigger in the wild:** Bazel's `rules_java` materializes the JDK into a
   runfiles tree where **every** file — including `lib\modules` — is a symlink back
   to the external cache. A subprocess `java` launched from that tree therefore has
-  a symlinked `lib\modules` and crashes. (A plain `java_test` does not, because
-  Bazel's test wrapper launches `java` from a path where `lib\modules` is real.)
+  a symlinked `lib\modules` and crashes. Bazel is incidental, though: a stock JDK
+  with a single symlinked `lib\modules` reproduces it without any build tool.
 
 ## Crash signature (CDS on)
 
@@ -65,40 +65,8 @@ rather than the target's, yielding an empty mapping). The repro captures
 
 ## Reproduction (no Bazel required)
 
-`repro.ps1` builds JDK copies and toggles one variable at a time, classifying a
-run as **CRASH** only when a real `hs_err` with `EXCEPTION_ACCESS_VIOLATION` is
-written (a clean nonzero-exit abort is reported as **ABORT**, never as the bug).
-
-```powershell
-# Windows 10+, Developer Mode or elevated shell (so real symlinks can be made).
-# JAVA_HOME points at any JDK (vendor-independent).
-pwsh ./repro.ps1
-```
-
-### Evidence matrix (representative; identical conclusion on all vendors × 21/25)
-
-Each row is a real-file JDK copy with exactly the named file(s) replaced by a
-symlink, then `java -version`:
-
-| Test | What is a symlink | Path | Result |
-|---|---|---|---|
-| B2 | `bin\server\classes.jsa` only | short | OK |
-| C  | `bin\server\classes.jsa` only | deep (~200) | OK |
-| F1 | `bin\java.exe` only | short | OK |
-| F2 | `bin\server\jvm.dll` only | short | OK |
-| F4 | `bin\server\jvm.dll` + `classes.jsa` | short | OK |
-| F5 | entire `bin\` subtree | short | OK |
-| **F3** | **`lib\modules` only** | short | **CRASH** (EXCEPTION_ACCESS_VIOLATION) |
-| F6 | entire `lib\` subtree (contains `lib\modules`) | short | CRASH |
-| D / E | full per-file symlink tree (Bazel shape) | short / deep | CRASH |
-| **F7** | `lib\modules`, **`-Xshare:off`** | short | **ABORT** — `NoClassDefFoundError: java.lang.Object` |
-| F8 | `lib\modules`, `-Xshare:on` | short | CRASH |
-
-Conclusion: the single sufficient trigger is a symlinked `lib\modules`; nothing
-else (including `classes.jsa`, `jvm.dll`, `java.exe`, the whole `bin\`, or path
-depth) reproduces, and disabling CDS does not avoid the failure.
-
-### Minimal manual version
+Copy a stock JDK, replace **only** `lib\modules` with a symlink to the real
+image, then run `java -version`. The single variable is regular-file-vs-symlink.
 
 ```powershell
 $real = $env:JAVA_HOME
@@ -111,6 +79,28 @@ New-Item -ItemType SymbolicLink -Path $mod -Target "$real\lib\modules"
 & "$link\bin\java.exe" -version             # EXCEPTION_ACCESS_VIOLATION, hs_err written
 & "$link\bin\java.exe" -Xshare:off -version # NoClassDefFoundError: java.lang.Object (still fails)
 ```
+
+### How the trigger was localized
+
+We symlinked one file (or subtree) at a time on an otherwise byte-identical
+real-file JDK copy, then ran `java -version`. Only `lib\modules` reproduces:
+
+| What is a symlink | Result |
+|---|---|
+| `bin\server\classes.jsa` only | OK |
+| `bin\java.exe` only | OK |
+| `bin\server\jvm.dll` only | OK |
+| `bin\server\jvm.dll` + `classes.jsa` | OK |
+| entire `bin\` subtree | OK |
+| deep (~200-char) launch path, real files | OK |
+| **`lib\modules` only** | **CRASH** (`EXCEPTION_ACCESS_VIOLATION`) |
+| entire `lib\` subtree (contains `lib\modules`) | CRASH |
+| full per-file symlink tree (Bazel shape) | CRASH |
+| `lib\modules`, **`-Xshare:off`** | ABORT — `NoClassDefFoundError: java.lang.Object` |
+
+The single sufficient trigger is a symlinked `lib\modules`; nothing else
+(`classes.jsa`, `jvm.dll`, `java.exe`, the whole `bin\`, or path depth)
+reproduces, and disabling CDS does not avoid the failure.
 
 ## Expected vs actual
 
@@ -131,8 +121,8 @@ symptom.
 
 ## Artifacts to attach
 
-From the `repro.ps1` output directory: `hs_err_pid*.log`, `*.mdmp`,
-`results.json`, and the per-run `*.out.txt` / `*.err.txt` (the `F3`/`F7`/`F8`
-files show the crash, the `-Xshare:off` `NoClassDefFoundError`, and the
-`-Xshare:on` crash respectively). CI logs/artifacts are produced by the
-`repro.yml` workflow in this repository across the vendor × version matrix.
+`hs_err_pid*.log` (and any minidump) from a crashed `java -version`. The
+[`repro.yml`](.github/workflows/repro.yml) workflow in this repository runs the
+steps above on `windows-latest` across a Temurin Java-version matrix
+(11/17/21/25) and uploads each `hs_err_*.log` — useful for confirming the crash
+predates the current LTS line (i.e. is long-standing, not a recent regression).
