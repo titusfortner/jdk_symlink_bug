@@ -1,0 +1,32 @@
+name: JDK symlink bug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    name: reproducible crash
+    steps:
+      - name: Copy the runner's JDK to a writable location
+        shell: pwsh
+        run: Copy-Item -Recurse -Force $env:JAVA_HOME C:\jdk-copy
+
+      - name: Symlink modules to the real module image
+        shell: pwsh
+        run: |
+          Remove-Item C:\jdk-copy\lib\modules -Force
+          New-Item -ItemType SymbolicLink -Path C:\jdk-copy\lib\modules -Target "$env:JAVA_HOME\lib\modules"
+
+      - name: Executing java should not crash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & "C:\jdk-copy\bin\java.exe" "-XX:ErrorFile=$env:RUNNER_TEMP\hs_err_pid%p.log" -version
+
+      - name: Upload the hs_err crash log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hs_err
+          path: ${{ runner.temp }}/hs_err_*.log
